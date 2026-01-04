@@ -1,0 +1,7 @@
+azure-storage-blob==12.19.1
+pandas
+matplotlib
+pyspark
+scipy
+pipeline-dp==0.2.2rc2
+
