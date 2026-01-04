@@ -19,9 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install PipelineDP from GitHub
 RUN pip install git+https://github.com/OpenMined/PipelineDP.git#egg=pipeline_dp
 
-# Copy your modules
 COPY dp_app/ /app/dp_app
 
-COPY dp_app/ /app/dp_app
 
 CMD ["python", "-m", "dp_app.main"]
+
