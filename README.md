@@ -46,7 +46,6 @@ Key objectives:
 
 ## 📂 Repository Structure
 
-.
 ├── dp_app/
 │   ├── bronze_reader.py      # Read & flatten raw JSON events
 │   ├── silver_layer.py       # Spark transformations (clean session data)
@@ -130,7 +129,7 @@ Key constraints:
 - Explicit value bounds for numerical metrics
 
 Example configuration:
-```python
+
 AggregateParams(
     metrics=[Metrics.MEAN],
     min_value=0,
