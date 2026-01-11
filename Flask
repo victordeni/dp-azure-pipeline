@@ -1,0 +1,222 @@
+from flask import Flask, Response
+import json
+import time
+import random
+import psutil
+from azure.eventhub import EventHubProducerClient, EventData
+import threading
+import atexit
+
+# ------------------------------------------------------------------------------
+
+FULL_CITY_RATE = 0.8 
+
+# ------------------------------------------------------------------------------
+
+# Azure Event Hub configuration
+EVENT_HUB_CONN_STR = "tocomplete"
+EVENT_HUB_NAME = "dp-events"
+
+producer = EventHubProducerClient.from_connection_string(
+    conn_str=EVENT_HUB_CONN_STR,
+    eventhub_name=EVENT_HUB_NAME
+)
+
+# ------------------------------------------------------------------------------
+
+app = Flask(__name__)
+FILENAME = "ga_sessions.json"
+
+with open(FILENAME, "r", encoding="utf-8") as f:
+    data_examples = [json.loads(line) for line in f if line.strip()]
+
+if not data_examples:
+    raise SystemExit("Aucune ligne trouvée dans ga_sessions.json")
+
+print(f"[INFO] Chargé : {len(data_examples)} exemples depuis {FILENAME}")
+
+# ------------------------------------------------------------------------------
+
+def log(msg, level="INFO"):
+    print(f"[{level}] {time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}")
+
+# ------------------------------------------------------------------------------
+
+visitor_counter = {}
+
+event_count_total = 0 # compteur pour thread benchmark
+event_count_total_global = 0 # compteur total global
+latencies = [] # latences Event Hub
+
+start_time_script = time.time()
+
+# ------------------------------------------------------------------------------
+
+def on_shutdown():
+    print("\n======================")
+    print("SERVER SHUTDOWN")
+    print(f"📊 Total events sent: {event_count_total_global}")
+    print("======================\n")
+
+atexit.register(on_shutdown)
+
+# ------------------------------------------------------------------------------
+
+def has_city(line):
+    
+    geo = line.get("geoNetwork", {})
+    city = geo.get("city")
+    invalid_values = ("not available in demo dataset", "(not set)", None, "")
+    return city not in invalid_values
+
+# ------------------------------------------------------------------------------
+
+
+city_rows = [line for line in data_examples if has_city(line)]
+no_city_rows = [line for line in data_examples if not has_city(line)]
+
+log(f"Lignes avec city : {len(city_rows)}")
+log(f"Lignes sans city : {len(no_city_rows)}")
+
+if not city_rows or not no_city_rows:
+    raise SystemExit("Dataset insuffisant pour appliquer un ratio 80/20")
+
+# ------------------------------------------------------------------------------
+
+def filter_useful_fields(line):
+    hits = line.get("hits", [])
+    visitor_id = line.get("fullVisitorId")
+
+    visit_number = visitor_counter.get(visitor_id, 0) + 1
+    visitor_counter[visitor_id] = visit_number
+
+    geo = line.get("geoNetwork", {})
+
+    cleaned = {
+        "fullVisitorId": visitor_id,
+        "visitId": line.get("visitId"),
+        "visitNumber": visit_number,
+        "visitStartTime": line.get("visitStartTime"),
+        "date": line.get("date"),
+        "geoNetwork": {
+            "country": geo.get("country"),
+            "continent": geo.get("continent"),
+            "city": geo.get("city"),
+            "region": geo.get("region"),
+        },
+        "device": {
+            "browser": line.get("device", {}).get("browser"),
+            "operatingSystem": line.get("device", {}).get("operatingSystem"),
+            "deviceCategory": line.get("device", {}).get("deviceCategory"),
+        },
+        "summary": {
+            "num_hits": len(hits),
+            "num_pageviews": sum(1 for h in hits if h.get("type") == "PAGE"),
+            "num_events": sum(1 for h in hits if h.get("type") == "EVENT"),
+            "total_time_on_page": sum(int(h.get("time", 0)) for h in hits)
+        },
+        "purchases": []
+    }
+
+    for hit in hits:
+        for p in hit.get("product", []):
+            if p.get("productAction") == "purchase":
+                cleaned["purchases"].append({
+                    "name": p.get("v2ProductName"),
+                    "SKU": p.get("productSKU"),
+                    "category": p.get("v2ProductCategory"),
+                    "price": p.get("productPrice"),
+                })
+
+    return cleaned
+
+# ------------------------------------------------------------------------------
+
+def send_to_eventhub(payload_dict):
+    
+    global event_count_total, latencies, event_count_total_global
+    start = time.time()
+    try:
+        event_data = EventData(json.dumps(payload_dict))
+        producer.send_batch([event_data])
+    except Exception as e:
+        log(f"Failed to send to Event Hub: {e}", level="ERROR")
+        return
+
+    latency_ms = (time.time() - start) * 1000
+    latencies.append(latency_ms)
+
+    event_count_total += 1
+    event_count_total_global += 1
+
+    log(f"EventHub latency={latency_ms:.2f} ms", level="PERF")
+
+# ------------------------------------------------------------------------------
+
+def benchmark_logger():
+    
+    global latencies, event_count_total
+    while True:
+        time.sleep(10)
+        if event_count_total == 0:
+            continue
+
+        avg_latency = sum(latencies) / len(latencies)
+        min_latency = min(latencies)
+        max_latency = max(latencies)
+        mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
+        cpu_percent = psutil.cpu_percent(interval=None)
+        events_s = event_count_total / 10
+
+        log(
+            f"[PERF SUMMARY] Events total: {event_count_total} | "
+            f"Events/s: {events_s:.2f} | Latency ms: avg={avg_latency:.2f} "
+            f"min={min_latency:.2f} max={max_latency:.2f} | "
+            f"CPU: {cpu_percent:.1f}% | RAM: {mem_mb:.1f} MB",
+            level="PERF"
+        )
+
+        event_count_total = 0
+        latencies = []
+
+threading.Thread(target=benchmark_logger, daemon=True).start()
+
+# ------------------------------------------------------------------------------
+
+def stream_dataset():
+  
+    global event_count_total, event_count_total_global
+
+    while True:
+        
+        if random.random() < 0.05: 
+            pause = random.randint(5, 20)
+            log(f"⏸️ Server pause for {pause}s")
+            time.sleep(pause)
+
+        if random.random() < FULL_CITY_RATE:
+            base = random.choice(city_rows)
+        else:
+            base = random.choice(no_city_rows)
+
+        cleaned = filter_useful_fields(base)
+
+        # SSE
+        yield f"data: {json.dumps(cleaned, ensure_ascii=False)}\n\n"
+
+        # Event Hub
+        send_to_eventhub(cleaned)
+
+        time.sleep(0.5)
+
+# ------------------------------------------------------------------------------
+
+@app.route("/stream")
+def stream():
+    return Response(stream_dataset(), mimetype="text/event-stream")
+
+# ------------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    log("🚀 Démarrage du serveur Flask...")
+    app.run(host="0.0.0.0", port=5000, threaded=True)
